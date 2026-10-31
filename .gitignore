@@ -1,0 +1,11 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+node_modules/
+dist/
+.DS_Store
+*.log
+backend/data/*.csv
+!backend/data/.gitkeep
