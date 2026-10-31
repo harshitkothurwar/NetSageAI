@@ -1,4 +1,4 @@
-"""LLM diagnosis service — OpenAI or Anthropic via HTTP, JSON-only output."""
+"""NetSage AI diagnosis service: Gemini, OpenAI or Anthropic."""
 
 from __future__ import annotations
 
@@ -74,6 +74,36 @@ def _extract_json(raw: str) -> dict[str, str]:
     return out
 
 
+async def _gemini_complete(user_content: str) -> str:
+    """Use Google's OpenAI-compatible Gemini REST endpoint."""
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    model = os.getenv("GEMINI_MODEL", "").strip()
+    if not api_key or not model or api_key == "PASTE_YOUR_API_KEY_HERE":
+        raise RuntimeError("Gemini API key or model is missing")
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        content = payload["choices"][0]["message"]["content"]
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("Empty text response from Gemini")
+        return content
+
+
 async def _openai_complete(user_content: str) -> str:
     api_key = os.getenv("OPENAI_API_KEY", "")
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -134,17 +164,38 @@ async def diagnose(symptom: str, show_output: str) -> dict[str, Any]:
     )
     provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
     try:
-        if provider == "anthropic":
+        if provider == "gemini":
+            raw = await _gemini_complete(user_content)
+        elif provider == "anthropic":
             raw = await _anthropic_complete(user_content)
-        else:
+        elif provider == "openai":
             raw = await _openai_complete(user_content)
+        else:
+            raise ValueError("Unsupported LLM_PROVIDER setting")
+
         parsed = _extract_json(raw)
+        if parsed["root_cause"] == "Unparseable model output":
+            raise ValueError("Model returned invalid JSON")
+        if parsed["confidence"] not in {"High", "Medium", "Low"}:
+            parsed["confidence"] = "Low"
+        if parsed["osi_layer"] not in {
+            "Layer 1", "Layer 2", "Layer 3", "Layer 4", "Layer 7", "Multiple"
+        }:
+            parsed["osi_layer"] = "Multiple"
         return {"provider": provider, "ok": True, "diagnosis": parsed, "error": None}
-    except Exception as exc:  # noqa: BLE001 — surface API errors to the UI
-        fallback = _empty_diagnosis(f"AI service error: {exc}")
+    except Exception as exc:
+        # Do not expose raw provider errors or credentials to users.
+        if isinstance(exc, httpx.HTTPStatusError):
+            message = f"AI provider returned HTTP {exc.response.status_code}"
+        elif isinstance(exc, httpx.TimeoutException):
+            message = "AI provider request timed out"
+        elif isinstance(exc, (RuntimeError, ValueError)):
+            message = str(exc)
+        else:
+            message = "AI provider request failed"
         return {
             "provider": provider,
             "ok": False,
-            "diagnosis": fallback,
-            "error": str(exc),
+            "diagnosis": _empty_diagnosis("AI diagnosis unavailable"),
+            "error": message,
         }
